@@ -1,4 +1,4 @@
-# app.py - LeadForge Pro v5.0 (Windows Compatible Edition)
+# app.py - LeadForge Pro v6.0 (Windows Optimized Edition)
 from flask import Flask, request, render_template_string, jsonify, Response
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 import csv
 import io
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -25,14 +27,13 @@ from phonenumbers import carrier, geocoder, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
 import secrets
-import asyncio
-import aiohttp
-from aiohttp import ClientTimeout, ClientSession
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from collections import defaultdict
@@ -40,20 +41,29 @@ import uuid
 import random
 import socket
 import platform
+import os
+import sys
+from queue import Queue
+import time
 
 # Windows compatibility fixes
 IS_WINDOWS = platform.system() == 'Windows'
 
-# Fix for asyncio on Windows
 if IS_WINDOWS:
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Fix for asyncio on Windows - but we're avoiding asyncio entirely
+    import asyncio
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except:
+        pass
 
 # ==================== Configuration ====================
 class Config:
     SECRET_KEY = secrets.token_urlsafe(32)
     DATABASE = 'leads.db'
-    MAX_CONCURRENT_REQUESTS = 5  # Lower for Windows
+    MAX_WORKERS = 3  # Conservative for Windows
     REQUEST_TIMEOUT = 30
+    MAX_RETRIES = 3
     RATE_LIMIT = "200 per hour"
     RATE_LIMIT_PER_IP = "100 per hour"
     USER_AGENTS = [
@@ -61,11 +71,12 @@ class Config:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Edg/120.0.0.0',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36',
     ]
     
-    # API Keys (optional - for enrichment features)
-    HUNTER_API_KEY = ""  # Add your Hunter.io API key
-    CLEARBIT_API_KEY = ""  # Add your Clearbit API key
+    # Common paths to exclude
+    EXCLUDE_PATHS = ['/logout', '/login', '/signup', '/register', '/cart', '/checkout', 
+                     '/admin', '/wp-admin', '/dashboard', '/account', '/profile']
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -80,64 +91,72 @@ limiter = Limiter(
 )
 
 # Setup logging with Windows-compatible paths
-log_handler = RotatingFileHandler('leadforge.log', maxBytes=10000000, backupCount=5)
-log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-app.logger.addHandler(log_handler)
-app.logger.setLevel(logging.INFO)
+try:
+    log_handler = RotatingFileHandler('leadforge.log', maxBytes=10000000, backupCount=5)
+    log_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    app.logger.addHandler(log_handler)
+    app.logger.setLevel(logging.INFO)
+except:
+    # Fallback to console logging if file can't be created
+    logging.basicConfig(level=logging.INFO)
+    app.logger.setLevel(logging.INFO)
 
 # ==================== Database Setup ====================
 def init_db():
     """Initialize database with all necessary tables"""
-    conn = sqlite3.connect(Config.DATABASE)
-    c = conn.cursor()
-    
-    # Scraping sessions table
-    c.execute('''CREATE TABLE IF NOT EXISTS scraping_sessions
-                 (id TEXT PRIMARY KEY,
-                  url TEXT,
-                  status TEXT,
-                  emails_found INTEGER DEFAULT 0,
-                  phones_found INTEGER DEFAULT 0,
-                  social_found INTEGER DEFAULT 0,
-                  pages_scraped INTEGER DEFAULT 0,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  completed_at TIMESTAMP,
-                  ip_address TEXT,
-                  user_agent TEXT)''')
-    
-    # Leads table
-    c.execute('''CREATE TABLE IF NOT EXISTS leads
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  session_id TEXT,
-                  type TEXT,
-                  value TEXT,
-                  source_url TEXT,
-                  confidence_score REAL,
-                  verified BOOLEAN DEFAULT 0,
-                  enrichment_data TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                  FOREIGN KEY (session_id) REFERENCES scraping_sessions (id))''')
-    
-    # Blacklist table
-    c.execute('''CREATE TABLE IF NOT EXISTS blacklist
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  domain TEXT UNIQUE,
-                  reason TEXT,
-                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-    
-    # Statistics table
-    c.execute('''CREATE TABLE IF NOT EXISTS statistics
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  total_sessions INTEGER DEFAULT 0,
-                  total_emails INTEGER DEFAULT 0,
-                  total_phones INTEGER DEFAULT 0,
-                  total_pages_scraped INTEGER DEFAULT 0,
-                  date DATE UNIQUE)''')
-    
-    conn.commit()
-    conn.close()
-    
-    app.logger.info("Database initialized successfully")
+    try:
+        conn = sqlite3.connect(Config.DATABASE)
+        c = conn.cursor()
+        
+        # Scraping sessions table
+        c.execute('''CREATE TABLE IF NOT EXISTS scraping_sessions
+                     (id TEXT PRIMARY KEY,
+                      url TEXT,
+                      status TEXT,
+                      emails_found INTEGER DEFAULT 0,
+                      phones_found INTEGER DEFAULT 0,
+                      social_found INTEGER DEFAULT 0,
+                      pages_scraped INTEGER DEFAULT 0,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      completed_at TIMESTAMP,
+                      ip_address TEXT,
+                      user_agent TEXT)''')
+        
+        # Leads table
+        c.execute('''CREATE TABLE IF NOT EXISTS leads
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      session_id TEXT,
+                      type TEXT,
+                      value TEXT,
+                      source_url TEXT,
+                      confidence_score REAL,
+                      verified BOOLEAN DEFAULT 0,
+                      enrichment_data TEXT,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      FOREIGN KEY (session_id) REFERENCES scraping_sessions (id))''')
+        
+        # Blacklist table
+        c.execute('''CREATE TABLE IF NOT EXISTS blacklist
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      domain TEXT UNIQUE,
+                      reason TEXT,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        
+        # Statistics table
+        c.execute('''CREATE TABLE IF NOT EXISTS statistics
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      total_sessions INTEGER DEFAULT 0,
+                      total_emails INTEGER DEFAULT 0,
+                      total_phones INTEGER DEFAULT 0,
+                      total_pages_scraped INTEGER DEFAULT 0,
+                      date DATE UNIQUE)''')
+        
+        conn.commit()
+        conn.close()
+        
+        app.logger.info("Database initialized successfully")
+    except Exception as e:
+        app.logger.error(f"Database initialization error: {str(e)}")
 
 init_db()
 
@@ -318,21 +337,26 @@ class AdvancedExtractor:
         
         return enrichment
 
-# ==================== Pro Web Scraper ====================
-class ProWebScraper:
-    """Professional web scraper with async support"""
+# ==================== Synchronous Web Scraper (Windows Optimized) ====================
+class WindowsWebScraper:
+    """Professional web scraper optimized for Windows - no asyncio"""
     
     def __init__(self):
-        self.session = None
-        self.executor = ThreadPoolExecutor(max_workers=Config.MAX_CONCURRENT_REQUESTS)
+        self.session = self._create_session()
         self.visited_urls = set()
     
-    async def get_session(self):
-        if not self.session:
-            timeout = ClientTimeout(total=Config.REQUEST_TIMEOUT)
-            connector = aiohttp.TCPConnector(limit=Config.MAX_CONCURRENT_REQUESTS, ssl=False)
-            self.session = ClientSession(timeout=timeout, connector=connector)
-        return self.session
+    def _create_session(self):
+        """Create a requests session with retry strategy"""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=Config.MAX_RETRIES,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
     
     def get_headers(self, referer: str = None) -> Dict:
         """Generate random headers for request"""
@@ -349,41 +373,46 @@ class ProWebScraper:
             headers['Referer'] = referer
         return headers
     
-    async def fetch_page(self, url: str, retry_count: int = 2) -> Dict:
-        """Async fetch page content with retry logic"""
+    def fetch_page(self, url: str, retry_count: int = 2) -> Dict:
+        """Fetch page content with retry logic - synchronous"""
         for attempt in range(retry_count):
             try:
-                session = await self.get_session()
                 headers = self.get_headers()
                 
-                async with session.get(url, headers=headers, allow_redirects=True) as response:
-                    if response.status == 200:
-                        html = await response.text()
-                        return {
-                            'success': True,
-                            'html': html,
-                            'url': str(response.url),
-                            'status': response.status,
-                            'final_url': str(response.url)
-                        }
-                    elif response.status in [429, 503]:
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    else:
-                        return {
-                            'success': False,
-                            'error': f'HTTP {response.status}',
-                            'url': url,
-                            'status': response.status
-                        }
-            except asyncio.TimeoutError:
+                # Add timeout to prevent hanging
+                response = self.session.get(url, headers=headers, timeout=Config.REQUEST_TIMEOUT, allow_redirects=True, verify=False)
+                
+                if response.status_code == 200:
+                    return {
+                        'success': True,
+                        'html': response.text,
+                        'url': url,
+                        'status': response.status_code,
+                        'final_url': response.url
+                    }
+                elif response.status_code in [429, 503]:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return {
+                        'success': False,
+                        'error': f'HTTP {response.status_code}',
+                        'url': url,
+                        'status': response.status_code
+                    }
+            except requests.exceptions.Timeout:
                 if attempt < retry_count - 1:
-                    await asyncio.sleep(1)
+                    time.sleep(1)
                     continue
                 return {'success': False, 'error': 'Timeout', 'url': url}
+            except requests.exceptions.ConnectionError as e:
+                if attempt < retry_count - 1:
+                    time.sleep(1)
+                    continue
+                return {'success': False, 'error': f'Connection error: {str(e)}', 'url': url}
             except Exception as e:
                 if attempt < retry_count - 1:
-                    await asyncio.sleep(1)
+                    time.sleep(1)
                     continue
                 return {'success': False, 'error': str(e), 'url': url}
         
@@ -435,9 +464,12 @@ class ProWebScraper:
                 full_url = urljoin(url, href)
                 try:
                     link_domain = urlparse(full_url).netloc
-                    if not link_domain or link_domain == base_domain:
+                    # Check if same domain and not in exclude paths
+                    if (not link_domain or link_domain == base_domain):
                         if not any(x in full_url.lower() for x in ['javascript:', '#', 'mailto:', 'tel:']):
-                            internal_links.add(full_url)
+                            # Exclude common non-content paths
+                            if not any(exclude in full_url.lower() for exclude in Config.EXCLUDE_PATHS):
+                                internal_links.add(full_url)
                 except:
                     continue
             
@@ -458,8 +490,8 @@ class ProWebScraper:
                 'html_size': 0
             }
     
-    async def deep_crawl(self, start_url: str, max_pages: int = 20, max_depth: int = 2) -> List[Dict]:
-        """Deep crawl website with depth control"""
+    def deep_crawl(self, start_url: str, max_pages: int = 20, max_depth: int = 2) -> List[Dict]:
+        """Deep crawl website with depth control - synchronous"""
         visited = set()
         queue = [(start_url, 0)]
         results = []
@@ -473,7 +505,10 @@ class ProWebScraper:
             visited.add(url)
             app.logger.info(f"Crawling: {url} (Depth: {depth})")
             
-            page_data = await self.fetch_page(url)
+            # Add small delay to be respectful
+            time.sleep(0.5)
+            
+            page_data = self.fetch_page(url)
             
             if page_data['success']:
                 parsed = self.parse_html(page_data['html'], url)
@@ -489,9 +524,6 @@ class ProWebScraper:
                     for link in parsed['internal_links']:
                         if link not in visited and link not in [q[0] for q in queue]:
                             queue.append((link, depth + 1))
-            
-            # Rate limiting
-            await asyncio.sleep(1)
         
         return results
 
@@ -516,83 +548,94 @@ class ExportManager:
     @staticmethod
     def to_excel(leads: List[Dict]) -> bytes:
         """Export to Excel with styling"""
-        data = []
-        for lead in leads:
-            data.append({
-                'Type': lead['type'],
-                'Value': lead['value'],
-                'Source URL': lead.get('source_url', ''),
-                'Confidence': f"{lead.get('confidence_score', 0)*100:.0f}%",
-                'Verified': 'Yes' if lead.get('verified') else 'No',
-                'Created At': lead.get('created_at', '')
-            })
-        
-        df = pd.DataFrame(data)
-        output = io.BytesIO()
-        
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Leads', index=False)
+        try:
+            data = []
+            for lead in leads:
+                data.append({
+                    'Type': lead['type'],
+                    'Value': lead['value'],
+                    'Source URL': lead.get('source_url', ''),
+                    'Confidence': f"{lead.get('confidence_score', 0)*100:.0f}%",
+                    'Verified': 'Yes' if lead.get('verified') else 'No',
+                    'Created At': lead.get('created_at', '')
+                })
             
-            # Auto-adjust column widths
-            worksheet = writer.sheets['Leads']
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 50)
-                worksheet.column_dimensions[column_letter].width = adjusted_width
-        
-        output.seek(0)
-        return output.getvalue()
+            df = pd.DataFrame(data)
+            output = io.BytesIO()
+            
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Leads', index=False)
+                
+                # Auto-adjust column widths
+                worksheet = writer.sheets['Leads']
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            output.seek(0)
+            return output.getvalue()
+        except Exception as e:
+            app.logger.error(f"Excel export error: {str(e)}")
+            # Fallback to CSV if Excel fails
+            return ExportManager.to_csv(leads).encode()
     
     @staticmethod
     def to_pdf(leads: List[Dict]) -> bytes:
         """Export to PDF with professional formatting"""
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=30, bottomMargin=30)
-        elements = []
-        
-        styles = getSampleStyleSheet()
-        title_style = styles['Title']
-        title_style.fontSize = 24
-        elements.append(Paragraph("LeadForge Pro - Lead Generation Report", title_style))
-        elements.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
-        elements.append(Paragraph("<br/><br/>", styles['Normal']))
-        
-        # Create table data
-        data = [['#', 'Type', 'Value', 'Confidence', 'Date']]
-        for idx, lead in enumerate(leads[:100], 1):
-            data.append([
-                str(idx),
-                lead['type'].upper(),
-                lead['value'],
-                f"{lead.get('confidence_score', 0)*100:.0f}%",
-                lead.get('created_at', 'N/A')[:16]
-            ])
-        
-        table = Table(data, repeatRows=1)
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#667eea')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 12),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('FONTSIZE', (0, 1), (-1, -1), 9),
-        ]))
-        
-        elements.append(table)
-        doc.build(elements)
-        
-        buffer.seek(0)
-        return buffer.getvalue()
+        try:
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=30, bottomMargin=30)
+            elements = []
+            
+            styles = getSampleStyleSheet()
+            title_style = styles['Title']
+            title_style.fontSize = 24
+            elements.append(Paragraph("LeadForge Pro - Lead Generation Report", title_style))
+            elements.append(Spacer(1, 12))
+            elements.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+            elements.append(Spacer(1, 12))
+            
+            # Create table data
+            data = [['#', 'Type', 'Value', 'Confidence', 'Date']]
+            for idx, lead in enumerate(leads[:100], 1):
+                data.append([
+                    str(idx),
+                    lead['type'].upper(),
+                    lead['value'][:50],  # Truncate long values
+                    f"{lead.get('confidence_score', 0)*100:.0f}%",
+                    lead.get('created_at', 'N/A')[:16]
+                ])
+            
+            table = Table(data, repeatRows=1)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#667eea')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ]))
+            
+            elements.append(table)
+            doc.build(elements)
+            
+            buffer.seek(0)
+            return buffer.getvalue()
+        except Exception as e:
+            app.logger.error(f"PDF export error: {str(e)}")
+            # Return CSV as fallback
+            return ExportManager.to_csv(leads).encode()
     
     @staticmethod
     def to_json(leads: List[Dict]) -> str:
@@ -666,6 +709,7 @@ def scrape():
     if not url:
         return jsonify({'error': 'No URL provided'}), 400
     
+    # Validate and fix URL
     if not validators.url(url):
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
@@ -685,20 +729,16 @@ def scrape():
     # Generate session ID
     session_id = str(uuid.uuid4())[:8]
     
-    # Run scraping asynchronously
+    # Run scraping in background thread
     def run_scraping():
         try:
-            # Create new event loop for this thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            scraper = ProWebScraper()
+            scraper = WindowsWebScraper()
             
             try:
                 if deep_crawl:
-                    results = loop.run_until_complete(scraper.deep_crawl(url, max_pages, max_depth=2))
+                    results = scraper.deep_crawl(url, max_pages, max_depth=2)
                 else:
-                    page_data = loop.run_until_complete(scraper.fetch_page(url))
+                    page_data = scraper.fetch_page(url)
                     if page_data['success']:
                         parsed = scraper.parse_html(page_data['html'], url)
                         results = [{
@@ -709,6 +749,7 @@ def scrape():
                         }]
                     else:
                         results = []
+                        app.logger.error(f"Failed to fetch {url}: {page_data.get('error', 'Unknown error')}")
                 
                 # Save results to database
                 conn = sqlite3.connect(Config.DATABASE)
@@ -788,19 +829,20 @@ def scrape():
                 
             except Exception as e:
                 app.logger.error(f"Scraping error for {url}: {str(e)}")
-                conn = sqlite3.connect(Config.DATABASE)
-                c = conn.cursor()
-                c.execute('INSERT INTO scraping_sessions (id, url, status, completed_at) VALUES (?, ?, ?, ?)',
-                         (session_id, url, 'failed', datetime.now()))
-                conn.commit()
-                conn.close()
-            finally:
-                loop.close()
+                try:
+                    conn = sqlite3.connect(Config.DATABASE)
+                    c = conn.cursor()
+                    c.execute('INSERT INTO scraping_sessions (id, url, status, completed_at) VALUES (?, ?, ?, ?)',
+                             (session_id, url, 'failed', datetime.now()))
+                    conn.commit()
+                    conn.close()
+                except:
+                    pass
                 
         except Exception as e:
             app.logger.error(f"Thread error for {url}: {str(e)}")
     
-    # Start async task
+    # Start background task
     thread = threading.Thread(target=run_scraping)
     thread.daemon = True
     thread.start()
@@ -816,91 +858,99 @@ def scrape():
 @app.route('/api/status/<session_id>', methods=['GET'])
 def get_status(session_id):
     """Get scraping session status and results"""
-    conn = sqlite3.connect(Config.DATABASE)
-    c = conn.cursor()
-    
-    c.execute('SELECT * FROM scraping_sessions WHERE id = ?', (session_id,))
-    session = c.fetchone()
-    
-    if not session:
+    try:
+        conn = sqlite3.connect(Config.DATABASE)
+        c = conn.cursor()
+        
+        c.execute('SELECT * FROM scraping_sessions WHERE id = ?', (session_id,))
+        session = c.fetchone()
+        
+        if not session:
+            conn.close()
+            return jsonify({'error': 'Session not found'}), 404
+        
+        c.execute('SELECT * FROM leads WHERE session_id = ?', (session_id,))
+        leads = c.fetchall()
+        
+        # Group leads by type
+        emails = [{'value': l[3], 'source': l[4], 'verified': bool(l[6])} for l in leads if l[2] == 'email']
+        phones = [{'value': l[3], 'source': l[4], 'verified': bool(l[6])} for l in leads if l[2] == 'phone']
+        social = [{'value': l[3], 'source': l[4]} for l in leads if l[2].startswith('social_')]
+        
         conn.close()
-        return jsonify({'error': 'Session not found'}), 404
-    
-    c.execute('SELECT * FROM leads WHERE session_id = ?', (session_id,))
-    leads = c.fetchall()
-    
-    # Group leads by type
-    emails = [{'value': l[3], 'source': l[4], 'verified': bool(l[6])} for l in leads if l[2] == 'email']
-    phones = [{'value': l[3], 'source': l[4], 'verified': bool(l[6])} for l in leads if l[2] == 'phone']
-    social = [{'value': l[3], 'source': l[4]} for l in leads if l[2].startswith('social_')]
-    
-    conn.close()
-    
-    return jsonify({
-        'session_id': session[0],
-        'url': session[1],
-        'status': session[2],
-        'emails_found': session[3],
-        'phones_found': session[4],
-        'social_found': session[5],
-        'pages_scraped': session[6],
-        'created_at': session[7],
-        'completed_at': session[8],
-        'emails': emails,
-        'phones': phones,
-        'social': social,
-        'total_leads': len(emails) + len(phones) + len(social)
-    })
+        
+        return jsonify({
+            'session_id': session[0],
+            'url': session[1],
+            'status': session[2],
+            'emails_found': session[3],
+            'phones_found': session[4],
+            'social_found': session[5],
+            'pages_scraped': session[6],
+            'created_at': session[7],
+            'completed_at': session[8],
+            'emails': emails,
+            'phones': phones,
+            'social': social,
+            'total_leads': len(emails) + len(phones) + len(social)
+        })
+    except Exception as e:
+        app.logger.error(f"Status check error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/api/export/<session_id>', methods=['GET'])
 def export_leads(session_id):
     """Export leads in various formats"""
     format_type = request.args.get('format', 'csv').lower()
     
-    conn = sqlite3.connect(Config.DATABASE)
-    c = conn.cursor()
-    
-    c.execute('SELECT * FROM leads WHERE session_id = ?', (session_id,))
-    leads_data = c.fetchall()
-    conn.close()
-    
-    if not leads_data:
-        return jsonify({'error': 'No leads found for this session'}), 404
-    
-    leads = []
-    for l in leads_data:
-        lead = {
-            'type': l[2],
-            'value': l[3],
-            'source_url': l[4],
-            'confidence_score': l[5],
-            'verified': bool(l[6]),
-            'created_at': l[8]
-        }
-        leads.append(lead)
-    
-    if format_type == 'csv':
-        content = ExportManager.to_csv(leads)
-        return Response(content, mimetype='text/csv', 
-                       headers={'Content-Disposition': f'attachment; filename=leads_{session_id}.csv'})
-    elif format_type in ['excel', 'xlsx']:
-        content = ExportManager.to_excel(leads)
-        return Response(content, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                       headers={'Content-Disposition': f'attachment; filename=leads_{session_id}.xlsx'})
-    elif format_type == 'pdf':
-        content = ExportManager.to_pdf(leads)
-        return Response(content, mimetype='application/pdf', 
-                       headers={'Content-Disposition': f'attachment; filename=leads_{session_id}.pdf'})
-    elif format_type == 'json':
-        content = ExportManager.to_json(leads)
-        return Response(content, mimetype='application/json', 
-                       headers={'Content-Disposition': f'attachment; filename=leads_{session_id}.json'})
-    elif format_type == 'html':
-        content = ExportManager.to_html(leads)
-        return Response(content, mimetype='text/html', 
-                       headers={'Content-Disposition': f'inline; filename=leads_{session_id}.html'})
-    else:
-        return jsonify({'error': 'Invalid format. Use: csv, excel, pdf, json, html'}), 400
+    try:
+        conn = sqlite3.connect(Config.DATABASE)
+        c = conn.cursor()
+        
+        c.execute('SELECT * FROM leads WHERE session_id = ?', (session_id,))
+        leads_data = c.fetchall()
+        conn.close()
+        
+        if not leads_data:
+            return jsonify({'error': 'No leads found for this session'}), 404
+        
+        leads = []
+        for l in leads_data:
+            lead = {
+                'type': l[2],
+                'value': l[3],
+                'source_url': l[4],
+                'confidence_score': l[5],
+                'verified': bool(l[6]),
+                'created_at': l[8]
+            }
+            leads.append(lead)
+        
+        if format_type == 'csv':
+            content = ExportManager.to_csv(leads)
+            return Response(content, mimetype='text/csv', 
+                           headers={'Content-Disposition': f'attachment; filename=leads_{session_id}.csv'})
+        elif format_type in ['excel', 'xlsx']:
+            content = ExportManager.to_excel(leads)
+            return Response(content, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                           headers={'Content-Disposition': f'attachment; filename=leads_{session_id}.xlsx'})
+        elif format_type == 'pdf':
+            content = ExportManager.to_pdf(leads)
+            return Response(content, mimetype='application/pdf', 
+                           headers={'Content-Disposition': f'attachment; filename=leads_{session_id}.pdf'})
+        elif format_type == 'json':
+            content = ExportManager.to_json(leads)
+            return Response(content, mimetype='application/json', 
+                           headers={'Content-Disposition': f'attachment; filename=leads_{session_id}.json'})
+        elif format_type == 'html':
+            content = ExportManager.to_html(leads)
+            return Response(content, mimetype='text/html', 
+                           headers={'Content-Disposition': f'inline; filename=leads_{session_id}.html'})
+        else:
+            return jsonify({'error': 'Invalid format. Use: csv, excel, pdf, json, html'}), 400
+    except Exception as e:
+        app.logger.error(f"Export error: {str(e)}")
+        return jsonify({'error': f'Export failed: {str(e)}'}), 500
 
 @app.route('/api/verify/batch', methods=['POST'])
 @limiter.limit("50 per minute")
@@ -946,44 +996,48 @@ def verify_batch():
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     """Get global statistics"""
-    conn = sqlite3.connect(Config.DATABASE)
-    c = conn.cursor()
-    
-    c.execute('SELECT COUNT(*) FROM scraping_sessions WHERE status = "completed"')
-    total_sessions = c.fetchone()[0] or 0
-    
-    c.execute('SELECT COUNT(*) FROM leads')
-    total_leads = c.fetchone()[0] or 0
-    
-    c.execute('SELECT COUNT(DISTINCT value) FROM leads WHERE type = "email"')
-    unique_emails = c.fetchone()[0] or 0
-    
-    c.execute('SELECT COUNT(DISTINCT value) FROM leads WHERE type = "phone"')
-    unique_phones = c.fetchone()[0] or 0
-    
-    # Get last 7 days stats
-    c.execute('''SELECT date, total_sessions, total_emails, total_phones 
-                 FROM statistics 
-                 WHERE date >= date("now", "-7 days")
-                 ORDER BY date''')
-    weekly_stats = c.fetchall()
-    
-    conn.close()
-    
-    return jsonify({
-        'total_sessions': total_sessions,
-        'total_leads': total_leads,
-        'unique_emails': unique_emails,
-        'unique_phones': unique_phones,
-        'weekly_stats': [
-            {
-                'date': stat[0],
-                'sessions': stat[1] or 0,
-                'emails': stat[2] or 0,
-                'phones': stat[3] or 0
-            } for stat in weekly_stats
-        ]
-    })
+    try:
+        conn = sqlite3.connect(Config.DATABASE)
+        c = conn.cursor()
+        
+        c.execute('SELECT COUNT(*) FROM scraping_sessions WHERE status = "completed"')
+        total_sessions = c.fetchone()[0] or 0
+        
+        c.execute('SELECT COUNT(*) FROM leads')
+        total_leads = c.fetchone()[0] or 0
+        
+        c.execute('SELECT COUNT(DISTINCT value) FROM leads WHERE type = "email"')
+        unique_emails = c.fetchone()[0] or 0
+        
+        c.execute('SELECT COUNT(DISTINCT value) FROM leads WHERE type = "phone"')
+        unique_phones = c.fetchone()[0] or 0
+        
+        # Get last 7 days stats
+        c.execute('''SELECT date, total_sessions, total_emails, total_phones 
+                     FROM statistics 
+                     WHERE date >= date("now", "-7 days")
+                     ORDER BY date''')
+        weekly_stats = c.fetchall()
+        
+        conn.close()
+        
+        return jsonify({
+            'total_sessions': total_sessions,
+            'total_leads': total_leads,
+            'unique_emails': unique_emails,
+            'unique_phones': unique_phones,
+            'weekly_stats': [
+                {
+                    'date': stat[0],
+                    'sessions': stat[1] or 0,
+                    'emails': stat[2] or 0,
+                    'phones': stat[3] or 0
+                } for stat in weekly_stats
+            ]
+        })
+    except Exception as e:
+        app.logger.error(f"Stats error: {str(e)}")
+        return jsonify({'error': 'Could not fetch statistics'}), 500
 
 @app.route('/api/search', methods=['POST'])
 @limiter.limit("50 per minute")
@@ -996,45 +1050,85 @@ def search_leads():
     if not query:
         return jsonify({'error': 'Search query required'}), 400
     
-    conn = sqlite3.connect(Config.DATABASE)
-    c = conn.cursor()
+    try:
+        conn = sqlite3.connect(Config.DATABASE)
+        c = conn.cursor()
+        
+        if lead_type == 'all':
+            c.execute('''SELECT DISTINCT value, type, source_url, created_at 
+                         FROM leads 
+                         WHERE LOWER(value) LIKE ? 
+                         ORDER BY created_at DESC 
+                         LIMIT 100''', (f'%{query}%',))
+        else:
+            c.execute('''SELECT DISTINCT value, type, source_url, created_at 
+                         FROM leads 
+                         WHERE type = ? AND LOWER(value) LIKE ? 
+                         ORDER BY created_at DESC 
+                         LIMIT 100''', (lead_type, f'%{query}%'))
+        
+        results = c.fetchall()
+        conn.close()
+        
+        return jsonify({
+            'query': query,
+            'type': lead_type,
+            'total_found': len(results),
+            'results': [
+                {
+                    'value': r[0],
+                    'type': r[1],
+                    'source': r[2],
+                    'date': r[3]
+                } for r in results
+            ]
+        })
+    except Exception as e:
+        app.logger.error(f"Search error: {str(e)}")
+        return jsonify({'error': 'Search failed'}), 500
+
+@app.route('/api/blacklist/add', methods=['POST'])
+def add_to_blacklist():
+    """Add domain to blacklist"""
+    data = request.get_json()
+    domain = data.get('domain')
+    reason = data.get('reason', 'Manual block')
     
-    if lead_type == 'all':
-        c.execute('''SELECT DISTINCT value, type, source_url, created_at 
-                     FROM leads 
-                     WHERE LOWER(value) LIKE ? 
-                     ORDER BY created_at DESC 
-                     LIMIT 100''', (f'%{query}%',))
-    else:
-        c.execute('''SELECT DISTINCT value, type, source_url, created_at 
-                     FROM leads 
-                     WHERE type = ? AND LOWER(value) LIKE ? 
-                     ORDER BY created_at DESC 
-                     LIMIT 100''', (lead_type, f'%{query}%'))
+    if not domain:
+        return jsonify({'error': 'Domain required'}), 400
     
-    results = c.fetchall()
-    conn.close()
-    
-    return jsonify({
-        'query': query,
-        'type': lead_type,
-        'total_found': len(results),
-        'results': [
-            {
-                'value': r[0],
-                'type': r[1],
-                'source': r[2],
-                'date': r[3]
-            } for r in results
-        ]
-    })
+    try:
+        conn = sqlite3.connect(Config.DATABASE)
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO blacklist (domain, reason) VALUES (?, ?)', (domain, reason))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'success': True, 'message': f'Domain {domain} blacklisted'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/clear-session/<session_id>', methods=['DELETE'])
+def clear_session(session_id):
+    """Delete a scraping session and its leads"""
+    try:
+        conn = sqlite3.connect(Config.DATABASE)
+        c = conn.cursor()
+        c.execute('DELETE FROM leads WHERE session_id = ?', (session_id,))
+        c.execute('DELETE FROM scraping_sessions WHERE id = ?', (session_id,))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'success': True, 'message': 'Session cleared'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # ==================== Web Interface ====================
 @app.route('/')
 def home():
     return render_template_string(HTML_TEMPLATE)
 
-# ==================== HTML Template (same as before) ====================
+# ==================== HTML Template ====================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1050,6 +1144,11 @@ HTML_TEMPLATE = """
         .gradient-bg { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
         .card-hover { transition: all 0.3s ease; }
         .card-hover:hover { transform: translateY(-5px); box-shadow: 0 20px 40px rgba(0,0,0,0.1); }
+        .fade-in { animation: fadeIn 0.5s ease-in; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
     </style>
 </head>
 <body class="bg-gray-50">
@@ -1060,11 +1159,14 @@ HTML_TEMPLATE = """
                 <div class="flex items-center space-x-3">
                     <i class="fas fa-fire fa-2x"></i>
                     <span class="text-2xl font-bold">LeadForge Pro</span>
-                    <span class="text-xs bg-white bg-opacity-20 px-2 py-1 rounded-full">Premium Edition</span>
+                    <span class="text-xs bg-white bg-opacity-20 px-2 py-1 rounded-full">Windows Edition</span>
                 </div>
                 <div class="flex space-x-4">
-                    <a href="#scraper" class="hover:text-gray-200">Scraper</a>
-                    <a href="#stats" class="hover:text-gray-200">Statistics</a>
+                    <a href="#scraper" class="hover:text-gray-200 transition">Scraper</a>
+                    <a href="#stats" class="hover:text-gray-200 transition">Statistics</a>
+                    <a href="#" onclick="clearAllData()" class="hover:text-gray-200 transition">
+                        <i class="fas fa-trash"></i> Clear
+                    </a>
                 </div>
             </div>
         </div>
@@ -1074,73 +1176,88 @@ HTML_TEMPLATE = """
     <div class="gradient-bg text-white py-16">
         <div class="container mx-auto px-6 text-center">
             <h1 class="text-4xl font-bold mb-4">Extract. Verify. Enrich.</h1>
-            <p class="text-xl opacity-90">Professional lead generation platform</p>
+            <p class="text-xl opacity-90">Professional lead generation platform optimized for Windows</p>
+            <div class="mt-4 text-sm opacity-75">
+                <i class="fas fa-check-circle"></i> No login required | <i class="fas fa-shield-alt"></i> Privacy focused
+            </div>
         </div>
     </div>
 
     <!-- Main Content -->
     <div class="container mx-auto px-6 py-12">
         <!-- Scraper Card -->
-        <div id="scraper" class="bg-white rounded-2xl shadow-xl p-8 mb-8 card-hover">
+        <div id="scraper" class="bg-white rounded-2xl shadow-xl p-8 mb-8 card-hover fade-in">
             <h2 class="text-2xl font-bold mb-4"><i class="fas fa-search text-purple-600 mr-2"></i>Lead Scraper</h2>
             
             <div class="mb-4">
                 <label class="block text-gray-700 font-semibold mb-2">Target URL</label>
-                <input type="url" id="scrapeUrl" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500" 
+                <input type="url" id="scrapeUrl" class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500 focus:ring-2 focus:ring-purple-200" 
                        placeholder="https://example.com/contact">
             </div>
             
             <div class="grid md:grid-cols-2 gap-4 mb-6">
-                <label class="flex items-center">
-                    <input type="checkbox" id="deepCrawl" class="mr-2 w-5 h-5">
+                <label class="flex items-center cursor-pointer">
+                    <input type="checkbox" id="deepCrawl" class="mr-2 w-5 h-5 text-purple-600">
                     <span>Deep Crawl <span class="text-sm text-gray-500">(crawl multiple pages)</span></span>
                 </label>
-                <label class="flex items-center">
-                    <input type="checkbox" id="verifyLeads" class="mr-2 w-5 h-5">
+                <label class="flex items-center cursor-pointer">
+                    <input type="checkbox" id="verifyLeads" class="mr-2 w-5 h-5 text-purple-600">
                     <span>Auto-Verify <span class="text-sm text-gray-500">(validate emails/phones)</span></span>
                 </label>
             </div>
             
-            <button onclick="startScraping()" id="scrapeBtn" class="w-full gradient-bg text-white font-bold py-3 rounded-lg hover:shadow-lg transition">
+            <button onclick="startScraping()" id="scrapeBtn" class="w-full gradient-bg text-white font-bold py-3 rounded-lg hover:shadow-lg transition transform hover:scale-105">
                 <i class="fas fa-rocket mr-2"></i>Start Scraping
             </button>
             
             <div id="progress" style="display:none;" class="mt-4 text-center">
-                <i class="fas fa-spinner fa-spin mr-2"></i>Scraping in progress...
+                <div class="inline-flex items-center px-4 py-2 bg-purple-100 text-purple-700 rounded-lg">
+                    <i class="fas fa-spinner fa-spin mr-2"></i>
+                    Scraping in progress... This may take a few moments.
+                </div>
             </div>
         </div>
 
         <!-- Statistics -->
-        <div id="stats" class="bg-white rounded-2xl shadow-xl p-8 mb-8">
+        <div id="stats" class="bg-white rounded-2xl shadow-xl p-8 mb-8 fade-in">
             <h2 class="text-2xl font-bold mb-4"><i class="fas fa-chart-bar text-purple-600 mr-2"></i>Global Statistics</h2>
             <div class="grid md:grid-cols-4 gap-4">
-                <div class="text-center p-4 bg-gray-50 rounded-lg">
+                <div class="text-center p-4 bg-gradient-to-br from-purple-50 to-purple-100 rounded-lg">
                     <div id="totalSessions" class="text-2xl font-bold text-purple-600">0</div>
-                    <div class="text-gray-600">Total Scrapes</div>
+                    <div class="text-gray-600 text-sm">Total Scrapes</div>
                 </div>
-                <div class="text-center p-4 bg-gray-50 rounded-lg">
+                <div class="text-center p-4 bg-gradient-to-br from-blue-50 to-blue-100 rounded-lg">
                     <div id="totalEmails" class="text-2xl font-bold text-blue-600">0</div>
-                    <div class="text-gray-600">Emails Found</div>
+                    <div class="text-gray-600 text-sm">Unique Emails</div>
                 </div>
-                <div class="text-center p-4 bg-gray-50 rounded-lg">
+                <div class="text-center p-4 bg-gradient-to-br from-green-50 to-green-100 rounded-lg">
                     <div id="totalPhones" class="text-2xl font-bold text-green-600">0</div>
-                    <div class="text-gray-600">Phone Numbers</div>
+                    <div class="text-gray-600 text-sm">Phone Numbers</div>
                 </div>
-                <div class="text-center p-4 bg-gray-50 rounded-lg">
+                <div class="text-center p-4 bg-gradient-to-br from-orange-50 to-orange-100 rounded-lg">
                     <div id="totalLeads" class="text-2xl font-bold text-orange-600">0</div>
-                    <div class="text-gray-600">Total Leads</div>
+                    <div class="text-gray-600 text-sm">Total Leads</div>
                 </div>
             </div>
         </div>
 
         <!-- Results -->
-        <div id="results" style="display:none;" class="bg-white rounded-2xl shadow-xl p-8">
-            <div class="flex justify-between items-center mb-4">
+        <div id="results" style="display:none;" class="bg-white rounded-2xl shadow-xl p-8 fade-in">
+            <div class="flex justify-between items-center mb-4 flex-wrap gap-2">
                 <h2 class="text-2xl font-bold"><i class="fas fa-trophy text-purple-600 mr-2"></i>Results</h2>
                 <div class="flex space-x-2">
-                    <button onclick="exportData('csv')" class="px-3 py-1 bg-green-600 text-white rounded">CSV</button>
-                    <button onclick="exportData('excel')" class="px-3 py-1 bg-blue-600 text-white rounded">Excel</button>
-                    <button onclick="exportData('pdf')" class="px-3 py-1 bg-red-600 text-white rounded">PDF</button>
+                    <button onclick="exportData('csv')" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition">
+                        <i class="fas fa-file-csv"></i> CSV
+                    </button>
+                    <button onclick="exportData('excel')" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition">
+                        <i class="fas fa-file-excel"></i> Excel
+                    </button>
+                    <button onclick="exportData('pdf')" class="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition">
+                        <i class="fas fa-file-pdf"></i> PDF
+                    </button>
+                    <button onclick="exportData('json')" class="px-4 py-2 bg-yellow-600 text-white rounded-lg hover:bg-yellow-700 transition">
+                        <i class="fas fa-code"></i> JSON
+                    </button>
                 </div>
             </div>
             <div id="resultsContent"></div>
@@ -1151,17 +1268,20 @@ HTML_TEMPLATE = """
         let currentSessionId = null;
         let statusInterval = null;
         
+        // Load stats on page load
         loadStats();
         setInterval(loadStats, 30000);
         
         async function loadStats() {
             try {
                 const response = await fetch('/api/stats');
-                const data = await response.json();
-                document.getElementById('totalSessions').textContent = data.total_sessions || 0;
-                document.getElementById('totalEmails').textContent = data.unique_emails || 0;
-                document.getElementById('totalPhones').textContent = data.unique_phones || 0;
-                document.getElementById('totalLeads').textContent = data.total_leads || 0;
+                if (response.ok) {
+                    const data = await response.json();
+                    document.getElementById('totalSessions').textContent = data.total_sessions || 0;
+                    document.getElementById('totalEmails').textContent = data.unique_emails || 0;
+                    document.getElementById('totalPhones').textContent = data.unique_phones || 0;
+                    document.getElementById('totalLeads').textContent = data.total_leads || 0;
+                }
             } catch(e) { console.error(e); }
         }
         
@@ -1171,7 +1291,7 @@ HTML_TEMPLATE = """
             const verifyLeads = document.getElementById('verifyLeads').checked;
             
             if (!url) {
-                alert('Please enter a URL');
+                showNotification('Please enter a URL', 'error');
                 return;
             }
             
@@ -1199,12 +1319,13 @@ HTML_TEMPLATE = """
                     currentSessionId = data.session_id;
                     if (statusInterval) clearInterval(statusInterval);
                     statusInterval = setInterval(checkStatus, 3000);
+                    showNotification('Scraping started! Checking status...', 'success');
                 } else {
-                    alert('Error: ' + data.error);
+                    showNotification('Error: ' + data.error, 'error');
                     resetButton();
                 }
             } catch(e) {
-                alert('Error: ' + e.message);
+                showNotification('Error: ' + e.message, 'error');
                 resetButton();
             }
         }
@@ -1221,10 +1342,11 @@ HTML_TEMPLATE = """
                     displayResults(data);
                     resetButton();
                     loadStats();
+                    showNotification(`Scraping completed! Found ${data.emails_found} emails and ${data.phones_found} phones.`, 'success');
                 } else if (data.status === 'failed') {
                     clearInterval(statusInterval);
-                    alert('Scraping failed');
                     resetButton();
+                    showNotification('Scraping failed. Please try a different URL.', 'error');
                 }
             } catch(e) {
                 console.error(e);
@@ -1237,41 +1359,75 @@ HTML_TEMPLATE = """
             let html = '<div class="space-y-4">';
             
             if (data.emails && data.emails.length > 0) {
-                html += '<div><h3 class="font-bold text-lg mb-2">📧 Emails</h3><div class="space-y-1">';
+                html += '<div><h3 class="font-bold text-lg mb-2 flex items-center"><i class="fas fa-envelope text-blue-600 mr-2"></i>Emails Found (' + data.emails.length + ')</h3><div class="space-y-1">';
                 data.emails.forEach(email => {
-                    html += `<div class="flex justify-between items-center p-2 bg-gray-50 rounded">
-                                <span class="font-mono">${escapeHtml(email.value)}</span>
-                                <button onclick="copyToClipboard('${escapeHtml(email.value)}')" class="text-purple-600">Copy</button>
+                    html += `<div class="flex justify-between items-center p-3 bg-gray-50 rounded-lg hover:bg-gray-100 transition">
+                                <span class="font-mono text-sm">${escapeHtml(email.value)}</span>
+                                <div class="space-x-2">
+                                    ${email.verified ? '<span class="text-green-600 text-xs"><i class="fas fa-check-circle"></i> Verified</span>' : ''}
+                                    <button onclick="copyToClipboard('${escapeHtml(email.value)}')" class="text-purple-600 hover:text-purple-800">
+                                        <i class="fas fa-copy"></i>
+                                    </button>
+                                </div>
                              </div>`;
                 });
                 html += '</div></div>';
+            } else {
+                html += '<div class="text-center py-8 text-gray-500"><i class="fas fa-inbox fa-3x mb-2"></i><p>No emails found</p></div>';
             }
             
             if (data.phones && data.phones.length > 0) {
-                html += '<div><h3 class="font-bold text-lg mb-2 mt-4">📞 Phone Numbers</h3><div class="space-y-1">';
+                html += '<div class="mt-4"><h3 class="font-bold text-lg mb-2 flex items-center"><i class="fas fa-phone text-green-600 mr-2"></i>Phone Numbers Found (' + data.phones.length + ')</h3><div class="space-y-1">';
                 data.phones.forEach(phone => {
-                    html += `<div class="flex justify-between items-center p-2 bg-gray-50 rounded">
-                                <span class="font-mono">${escapeHtml(phone.value)}</span>
-                                <button onclick="copyToClipboard('${escapeHtml(phone.value)}')" class="text-purple-600">Copy</button>
+                    html += `<div class="flex justify-between items-center p-3 bg-gray-50 rounded-lg hover:bg-gray-100 transition">
+                                <span class="font-mono text-sm">${escapeHtml(phone.value)}</span>
+                                <button onclick="copyToClipboard('${escapeHtml(phone.value)}')" class="text-purple-600 hover:text-purple-800">
+                                    <i class="fas fa-copy"></i>
+                                </button>
                              </div>`;
                 });
                 html += '</div></div>';
             }
             
+            html += '</div>';
+            
             if (data.emails.length === 0 && data.phones.length === 0) {
-                html += '<p class="text-center text-gray-500">No leads found. Try enabling Deep Crawl or a different URL.</p>';
+                html = '<div class="text-center py-8"><i class="fas fa-search fa-3x text-gray-400 mb-2"></i><p class="text-gray-500">No leads found. Try enabling Deep Crawl or a different URL.</p></div>';
             }
             
-            html += '</div>';
             document.getElementById('resultsContent').innerHTML = html;
         }
         
         async function exportData(format) {
             if (!currentSessionId) {
-                alert('No active session');
+                showNotification('No active session. Please run a scrape first.', 'error');
                 return;
             }
             window.open(`/api/export/${currentSessionId}?format=${format}`, '_blank');
+            showNotification(`Exporting as ${format.toUpperCase()}...`, 'success');
+        }
+        
+        async function clearAllData() {
+            if (!currentSessionId) {
+                showNotification('No active session to clear.', 'error');
+                return;
+            }
+            
+            if (confirm('Are you sure you want to clear this session\'s data?')) {
+                try {
+                    const response = await fetch(`/api/clear-session/${currentSessionId}`, {
+                        method: 'DELETE'
+                    });
+                    if (response.ok) {
+                        document.getElementById('results').style.display = 'none';
+                        currentSessionId = null;
+                        showNotification('Session cleared successfully!', 'success');
+                        loadStats();
+                    }
+                } catch(e) {
+                    showNotification('Error clearing session', 'error');
+                }
+            }
         }
         
         function resetButton() {
@@ -1283,7 +1439,23 @@ HTML_TEMPLATE = """
         
         function copyToClipboard(text) {
             navigator.clipboard.writeText(text);
-            alert('Copied: ' + text);
+            showNotification('Copied: ' + text, 'success');
+        }
+        
+        function showNotification(message, type) {
+            // Simple alert for now - can be replaced with toast notification
+            if (type === 'error') {
+                console.error(message);
+                alert('❌ ' + message);
+            } else if (type === 'success') {
+                console.log(message);
+                // Optional: show success message without alert
+                const notification = document.createElement('div');
+                notification.className = 'fixed bottom-4 right-4 bg-green-500 text-white px-6 py-3 rounded-lg shadow-lg fade-in';
+                notification.innerHTML = '<i class="fas fa-check-circle mr-2"></i>' + message;
+                document.body.appendChild(notification);
+                setTimeout(() => notification.remove(), 3000);
+            }
         }
         
         function escapeHtml(str) {
@@ -1295,14 +1467,22 @@ HTML_TEMPLATE = """
                 return m;
             });
         }
+        
+        // Enter key support
+        document.getElementById('scrapeUrl').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                startScraping();
+            }
+        });
     </script>
 </body>
 </html>
 """
 
+# ==================== Main Entry Point ====================
 if __name__ == '__main__':
     print("=" * 70)
-    print("🔥 LeadForge Pro v5.0 - Windows Edition")
+    print("🔥 LeadForge Pro v6.0 - Windows Optimized Edition")
     print("=" * 70)
     print(f"📍 Server: http://127.0.0.1:5000")
     print(f"💻 OS: {platform.system()} {platform.release()}")
@@ -1310,15 +1490,22 @@ if __name__ == '__main__':
     print("=" * 70)
     print("📊 Features:")
     print("   • No login required")
-    print("   • Async scraping (Windows optimized)")
+    print("   • Synchronous scraping (Windows optimized)")
     print("   • Email & phone validation")
-    print("   • Multiple export formats")
-    print("   • SQLite database")
+    print("   • Multiple export formats (CSV, Excel, PDF, JSON, HTML)")
+    print("   • SQLite database for persistence")
+    print("   • Rate limiting & error handling")
     print("=" * 70)
     print("🎯 Test URLs:")
-    print("   • https://www.python.org/contact")
-    print("   • https://www.yellowpages.com")
-    print("   • https://www.bbc.com/contact")
+    print("   • https://httpbin.org/html (Test server)")
+    print("   • https://www.python.org/")
+    print("   • https://example.com/")
+    print("=" * 70)
+    print("⚠️  Note: First scrape may take a few seconds")
     print("=" * 70)
     
-    app.run(debug=True, host='127.0.0.1', port=5000, threaded=True)
+    # Disable SSL warnings for testing
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    app.run(debug=False, host='127.0.0.1', port=5000, threaded=True)
