@@ -1,15 +1,13 @@
-# app.py - LeadForge v3 (Simplified & Reliable Version)
-from flask import Flask, request, render_template_string, Response, stream_with_context
+# app.py - LeadForge v4 (Working with AJAX)
+from flask import Flask, request, render_template_string, jsonify
 import re
 from datetime import datetime
 import csv
 import io
-import time
 import requests
 import json
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 
@@ -53,7 +51,6 @@ def scrape_page(url, timeout=15):
         return {
             'success': True,
             'text': clean_text(text),
-            'html': response.text,
             'soup': soup,
             'url': url
         }
@@ -72,13 +69,23 @@ def extract_emails_and_phones(text, soup):
         if '@' in email and '.' in email.split('@')[1]:
             emails.add(email)
     
-    # Find phones in text
-    found_phones = re.findall(PHONE_REGEX, text)
-    for phone in found_phones:
-        phone = re.sub(r'\s+', ' ', phone).strip()
-        digits = re.sub(r'\D', '', phone)
-        if len(digits) >= 8:
-            phones.add(phone)
+    # Find phones in text (simplified)
+    # Look for common phone patterns
+    phone_patterns = [
+        r'\+\d{1,3}[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}',
+        r'\d{3}[-.\s]?\d{3}[-.\s]?\d{4}',
+        r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}',
+        r'0[17]\d{8}',  # Kenyan numbers
+        r'\+254[17]\d{8}',
+    ]
+    
+    for pattern in phone_patterns:
+        found_phones = re.findall(pattern, text)
+        for phone in found_phones:
+            phone = re.sub(r'\s+', ' ', phone).strip()
+            digits = re.sub(r'\D', '', phone)
+            if len(digits) >= 8 and len(digits) <= 15:
+                phones.add(phone)
     
     # Check mailto: links
     for a in soup.find_all('a', href=True):
@@ -94,28 +101,30 @@ def extract_emails_and_phones(text, soup):
     
     return sorted(list(emails)), sorted(list(phones))
 
-def scrape_with_progress(url, deep_crawl=False):
-    """Main scraping function with progress updates"""
+@app.route('/scrape', methods=['POST'])
+def scrape():
+    data = request.get_json()
+    url = data.get('url', '')
+    deep_crawl = data.get('deep_crawl', False)
+    
+    if not url:
+        return jsonify({'error': 'No URL provided'}), 400
+    
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
     try:
-        yield "progress:10|Loading website...\n"
-        time.sleep(0.1)
-        
         # Scrape main page
         result = scrape_page(url)
         
         if not result['success']:
-            yield f"error: Failed to load page - {result.get('error', 'Unknown error')}\n"
-            return
-        
-        yield "progress:40|Extracting content...\n"
+            return jsonify({'error': f"Failed to load page: {result.get('error', 'Unknown error')}"}), 400
         
         all_text = result['text']
         all_soup = result['soup']
         all_emails, all_phones = extract_emails_and_phones(all_text, all_soup)
         
         if deep_crawl:
-            yield "progress:60|Deep Crawl - finding more pages...\n"
-            
             # Find relevant links
             links = []
             for a in all_soup.find_all('a', href=True):
@@ -123,29 +132,22 @@ def scrape_with_progress(url, deep_crawl=False):
                 full_url = urljoin(url, href)
                 if is_internal_link(url, full_url):
                     link_text = a.get_text().lower()
-                    if any(keyword in link_text for keyword in ['contact', 'about', 'team', 'contact us', 'get in touch']):
+                    if any(keyword in link_text for keyword in ['contact', 'about', 'team', 'contact us', 'get in touch', 'support']):
                         links.append(full_url)
             
             # Remove duplicates and limit
             links = list(dict.fromkeys(links))[:5]
             
-            if links:
-                yield f"progress:65|Found {len(links)} additional pages to check...\n"
-                
-                # Scrape additional pages
-                for i, link in enumerate(links):
-                    yield f"progress:{65 + (i+1)*5}|Checking page {i+1}/{len(links)}...\n"
-                    page_result = scrape_page(link, timeout=10)
-                    if page_result['success']:
-                        new_emails, new_phones = extract_emails_and_phones(
-                            page_result['text'], 
-                            page_result['soup']
-                        )
-                        all_emails.extend(new_emails)
-                        all_phones.extend(new_phones)
-                    time.sleep(0.5)  # Be polite
-        
-        yield "progress:90|Processing results...\n"
+            # Scrape additional pages
+            for link in links:
+                page_result = scrape_page(link, timeout=10)
+                if page_result['success']:
+                    new_emails, new_phones = extract_emails_and_phones(
+                        page_result['text'], 
+                        page_result['soup']
+                    )
+                    all_emails.extend(new_emails)
+                    all_phones.extend(new_phones)
         
         # Deduplicate
         all_emails = sorted(list(set(all_emails)))
@@ -165,51 +167,27 @@ def scrape_with_progress(url, deep_crawl=False):
         insights = {
             "company_name": title,
             "description": description,
-            "total_pages_scraped": 1 + (len(links) if deep_crawl else 0),
-            "keywords_found": []
+            "pages_scraped": 1 + (len(links) if deep_crawl else 0)
         }
         
-        leads = {
-            "emails": all_emails,
-            "phones": all_phones,
-            "insights": insights,
-            "total_leads": len(all_emails) + len(all_phones),
-            "url": url
-        }
-        
-        yield "progress:100|Complete!\n"
-        yield "data:" + json.dumps(leads, ensure_ascii=False) + "\n"
+        return jsonify({
+            'success': True,
+            'emails': all_emails,
+            'phones': all_phones,
+            'insights': insights,
+            'total_leads': len(all_emails) + len(all_phones),
+            'url': url
+        })
         
     except Exception as e:
-        yield f"error: {clean_text(str(e))}\n"
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/scrape')
-def scrape_stream():
-    url = request.args.get('url')
-    keywords = request.args.get('keywords', '')
-    deep_crawl = request.args.get('deep_crawl') == 'true'
-    
-    if not url:
-        return "No URL provided", 400
-    
-    if not url.startswith(('http://', 'https://')):
-        url = 'https://' + url
-    
-    def generate():
-        for chunk in scrape_with_progress(url, deep_crawl):
-            yield chunk
-    
-    return Response(
-        stream_with_context(generate()), 
-        mimetype='text/event-stream',
-        headers={'Cache-Control': 'no-cache'}
-    )
-
-@app.route('/download_csv', methods=['GET'])
+@app.route('/download_csv', methods=['POST'])
 def download_csv():
-    emails = request.args.getlist('emails')
-    phones = request.args.getlist('phones')
-    domain = request.args.get('domain', 'leads')
+    data = request.get_json()
+    emails = data.get('emails', [])
+    phones = data.get('phones', [])
+    domain = data.get('domain', 'leads')
     
     output = io.StringIO()
     writer = csv.writer(output)
@@ -242,7 +220,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LeadForge v3 - Simple & Reliable</title>
+    <title>LeadForge - Email & Phone Extractor</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -301,29 +279,30 @@ HTML_TEMPLATE = """
             width: 100%;
             transition: transform 0.2s;
         }
-        button:hover {
+        button:hover:not(:disabled) {
             transform: translateY(-2px);
         }
-        .progress-container {
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .loading {
             display: none;
+            text-align: center;
             margin-top: 20px;
         }
-        .progress-bar {
-            height: 8px;
-            background: #e0e0e0;
-            border-radius: 10px;
-            overflow: hidden;
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
         }
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #667eea, #764ba2);
-            width: 0%;
-            transition: width 0.3s;
-        }
-        .progress-text {
-            margin-top: 10px;
-            color: #666;
-            font-size: 0.9rem;
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
         .test-buttons {
             display: flex;
@@ -417,7 +396,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
 <div class="container">
-    <h1>🔗 LeadForge v3</h1>
+    <h1>🔗 LeadForge</h1>
     <div class="subtitle">Extract emails and phone numbers from any website</div>
     
     <div class="card">
@@ -443,14 +422,13 @@ HTML_TEMPLATE = """
             <button class="test-btn" onclick="setUrl('https://www.python.org')">Python.org</button>
             <button class="test-btn" onclick="setUrl('https://www.bbc.com/contact')">BBC Contact</button>
             <button class="test-btn" onclick="setUrl('https://www.github.com/contact')">GitHub Contact</button>
-            <button class="test-btn" onclick="setUrl('https://www.wikipedia.org')">Wikipedia</button>
+            <button class="test-btn" onclick="setUrl('https://www.yelp.com')">Yelp</button>
+            <button class="test-btn" onclick="setUrl('https://www.trustpilot.com')">Trustpilot</button>
         </div>
         
-        <div id="progressContainer" class="progress-container">
-            <div class="progress-bar">
-                <div id="progressFill" class="progress-fill"></div>
-            </div>
-            <div id="progressText" class="progress-text">Initializing...</div>
+        <div id="loading" class="loading">
+            <div class="spinner"></div>
+            <p>Scraping website... This may take a few seconds.</p>
         </div>
     </div>
     
@@ -459,13 +437,15 @@ HTML_TEMPLATE = """
 </div>
 
 <script>
-let currentEventSource = null;
+let isScraping = false;
 
 function setUrl(url) {
     document.getElementById('urlInput').value = url;
 }
 
-document.getElementById('extractBtn').addEventListener('click', function() {
+document.getElementById('extractBtn').addEventListener('click', async function() {
+    if (isScraping) return;
+    
     const url = document.getElementById('urlInput').value.trim();
     const keywords = document.getElementById('keywordsInput').value.trim();
     const deepCrawl = document.getElementById('deepCrawl').checked;
@@ -475,60 +455,53 @@ document.getElementById('extractBtn').addEventListener('click', function() {
         return;
     }
     
-    if (currentEventSource) {
-        currentEventSource.close();
-    }
-    
-    const progressContainer = document.getElementById('progressContainer');
-    const progressFill = document.getElementById('progressFill');
-    const progressText = document.getElementById('progressText');
+    const btn = document.getElementById('extractBtn');
+    const loading = document.getElementById('loading');
     const errorBox = document.getElementById('errorBox');
     const resultsDiv = document.getElementById('results');
     
-    progressContainer.style.display = 'block';
-    progressFill.style.width = '0%';
-    progressText.textContent = 'Starting...';
+    isScraping = true;
+    btn.disabled = true;
+    btn.textContent = '⏳ Scraping...';
+    loading.style.display = 'block';
     errorBox.style.display = 'none';
     resultsDiv.innerHTML = '';
     
-    const params = new URLSearchParams({ url: url, keywords: keywords, deep_crawl: deepCrawl });
-    currentEventSource = new EventSource('/scrape?' + params.toString());
-    
-    currentEventSource.onmessage = function(event) {
-        if (event.data.startsWith('progress:')) {
-            const msg = event.data.substring(9);
-            const [percent, text] = msg.split('|');
-            progressFill.style.width = percent + '%';
-            if (text) progressText.textContent = text;
-        } 
-        else if (event.data.startsWith('data:')) {
-            try {
-                const data = JSON.parse(event.data.substring(5));
-                displayResults(data);
-                currentEventSource.close();
-                currentEventSource = null;
-            } catch(e) {
-                showError('Failed to parse results');
-            }
+    try {
+        const response = await fetch('/scrape', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                url: url,
+                keywords: keywords,
+                deep_crawl: deepCrawl
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (data.error) {
+            throw new Error(data.error);
         }
-        else if (event.data.startsWith('error:')) {
-            showError(event.data.substring(6));
-            currentEventSource.close();
-            currentEventSource = null;
+        
+        if (data.success) {
+            displayResults(data);
+        } else {
+            throw new Error('Unknown error occurred');
         }
-    };
-    
-    currentEventSource.onerror = function() {
-        showError('Connection lost. Please try again with a different website.');
-        if (currentEventSource) {
-            currentEventSource.close();
-            currentEventSource = null;
-        }
-    };
+    } catch (error) {
+        showError(error.message);
+    } finally {
+        isScraping = false;
+        btn.disabled = false;
+        btn.textContent = '🚀 Start Scraping';
+        loading.style.display = 'none';
+    }
 });
 
 function displayResults(data) {
-    document.getElementById('progressContainer').style.display = 'none';
     const resultsDiv = document.getElementById('results');
     
     if (data.emails.length === 0 && data.phones.length === 0) {
@@ -539,8 +512,14 @@ function displayResults(data) {
                 <p style="margin-top: 15px;">Try:</p>
                 <ul style="margin-left: 20px;">
                     <li>Enabling "Deep Crawl"</li>
-                    <li>Trying a different website (like Yellow Pages or business directories)</li>
+                    <li>Trying a business directory like Yellow Pages</li>
                     <li>Checking a contact or about page</li>
+                </ul>
+                <p style="margin-top: 15px;">Example URLs that work well:</p>
+                <ul style="margin-left: 20px;">
+                    <li>https://www.yellowpages.com</li>
+                    <li>https://www.python.org</li>
+                    <li>https://www.bbc.com/contact</li>
                 </ul>
             </div>
         `;
@@ -571,52 +550,82 @@ function displayResults(data) {
                 <h3>ℹ️ Page Insights</h3>
                 <p><strong>Title:</strong> ${escapeHtml(data.insights.company_name)}</p>
                 <p><strong>Description:</strong> ${escapeHtml(data.insights.description || 'Not available')}</p>
-                <p><strong>Pages Scraped:</strong> ${data.insights.total_pages_scraped || 1}</p>
+                <p><strong>Pages Scraped:</strong> ${data.insights.pages_scraped || 1}</p>
             </div>
             ` : ''}
             
             ${data.emails.length > 0 ? `
             <h3>📧 Emails (${data.emails.length})</h3>
-            <table>
-                <thead><tr><th>Email Address</th><th>Action</th></tr></thead>
-                <tbody>
-                    ${data.emails.map(email => `
-                        <tr>
-                            <td><strong>${escapeHtml(email)}</strong></td>
-                            <td><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(email)}')">Copy</button></td>
-                        </tr>
-                    `).join('')}
-                </tbody>
-            </table>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr><th>Email Address</th><th>Action</th></tr>
+                    </thead>
+                    <tbody>
+                        ${data.emails.map(email => `
+                            <tr>
+                                <td><strong>${escapeHtml(email)}</strong></td>
+                                <td><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(email)}')">Copy</button></td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
             ` : ''}
             
             ${data.phones.length > 0 ? `
             <h3 style="margin-top: 30px;">📞 Phone Numbers (${data.phones.length})</h3>
-            <table>
-                <thead><tr><th>Phone Number</th><th>Action</th></tr></thead>
-                <tbody>
-                    ${data.phones.map(phone => `
-                        <tr>
-                            <td><strong>${escapeHtml(phone)}</strong></td>
-                            <td><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(phone)}')">Copy</button></td>
-                        </tr>
-                    `).join('')}
-                </tbody>
-            </table>
+            <div style="overflow-x: auto;">
+                <table>
+                    <thead>
+                        <tr><th>Phone Number</th><th>Action</th></tr>
+                    </thead>
+                    <tbody>
+                        ${data.phones.map(phone => `
+                            <tr>
+                                <td><strong>${escapeHtml(phone)}</strong></td>
+                                <td><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(phone)}')">Copy</button></td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            </div>
             ` : ''}
             
-            <form action="/download_csv" method="get" target="_blank" style="margin-top: 30px;">
-                ${data.emails.map(e => `<input type="hidden" name="emails" value="${escapeHtml(e)}">`).join('')}
-                ${data.phones.map(p => `<input type="hidden" name="phones" value="${escapeHtml(p)}">`).join('')}
-                <input type="hidden" name="domain" value="${escapeHtml(data.url)}">
-                <button type="submit" class="download-btn" style="width: 100%;">📥 Download CSV</button>
-            </form>
+            <button onclick="downloadCSV(${JSON.stringify(escapeHtml(data.emails))}, ${JSON.stringify(escapeHtml(data.phones))}, '${escapeHtml(data.url)}')" class="download-btn" style="width: 100%;">📥 Download CSV</button>
         </div>
     `;
 }
 
+async function downloadCSV(emails, phones, domain) {
+    try {
+        const response = await fetch('/download_csv', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                emails: emails,
+                phones: phones,
+                domain: domain
+            })
+        });
+        
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${domain.replace(/[^a-zA-Z0-9]/g, '_')}_leads.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(url);
+    } catch (error) {
+        showError('Failed to download CSV: ' + error.message);
+    }
+}
+
 function showError(msg) {
-    document.getElementById('progressContainer').style.display = 'none';
     const errorBox = document.getElementById('errorBox');
     errorBox.innerHTML = `<div class="error">⚠️ Error: ${escapeHtml(msg)}</div>`;
     errorBox.style.display = 'block';
@@ -637,7 +646,7 @@ function copyToClipboard(text) {
 
 function escapeHtml(str) {
     if (!str) return '';
-    return str.replace(/[&<>]/g, function(m) {
+    return String(str).replace(/[&<>]/g, function(m) {
         if (m === '&') return '&amp;';
         if (m === '<') return '&lt;';
         if (m === '>') return '&gt;';
@@ -650,13 +659,14 @@ function escapeHtml(str) {
 """
 
 if __name__ == '__main__':
-    print("=" * 50)
-    print("🚀 LeadForge v3 - Simplified & Reliable")
-    print("=" * 50)
+    print("=" * 60)
+    print("🚀 LeadForge v4 - Working Version")
+    print("=" * 60)
     print("📍 Running at: http://127.0.0.1:5000")
     print("📝 Try these test URLs:")
     print("   - https://www.yellowpages.com")
     print("   - https://www.python.org")
     print("   - https://www.bbc.com/contact")
-    print("=" * 50)
+    print("   - https://www.github.com/contact")
+    print("=" * 60)
     app.run(debug=True, port=5000, threaded=True)
