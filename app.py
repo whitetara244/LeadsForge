@@ -1060,7 +1060,7 @@ HTML_TEMPLATE = """
                 <div class="flex items-center space-x-3">
                     <i class="fas fa-fire fa-2x"></i>
                     <span class="text-2xl font-bold">LeadForge Pro</span>
-                    <span class="text-xs bg-white bg-opacity-20 px-2 py-1 rounded-full">Windows Edition</span>
+                    <span class="text-xs bg-white bg-opacity-20 px-2 py-1 rounded-full">Premium Edition</span>
                 </div>
                 <div class="flex space-x-4">
                     <a href="#scraper" class="hover:text-gray-200">Scraper</a>
@@ -1074,7 +1074,7 @@ HTML_TEMPLATE = """
     <div class="gradient-bg text-white py-16">
         <div class="container mx-auto px-6 text-center">
             <h1 class="text-4xl font-bold mb-4">Extract. Verify. Enrich.</h1>
-            <p class="text-xl opacity-90">Professional lead generation for Windows</p>
+            <p class="text-xl opacity-90">Professional lead generation platform</p>
         </div>
     </div>
 
