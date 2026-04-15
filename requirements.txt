@@ -1,0 +1,29 @@
+# LeadForge Pro - Windows Requirements
+# Install with: pip install -r requirements.txt
+
+# Core Web Framework
+Flask==2.3.3
+Flask-CORS==4.0.0
+Flask-Limiter==3.5.0
+
+# HTTP & Web Scraping
+requests==2.31.0
+aiohttp==3.9.1
+beautifulsoup4==4.12.2
+lxml==4.9.3
+
+# Validation
+validators==0.22.0
+email-validator==2.1.0
+phonenumbers==8.13.29
+
+# Data Processing & Export
+pandas==2.1.4
+openpyxl==3.1.2
+reportlab==4.0.7
+
+# Note: uvloop is NOT included - doesn't work on Windows
+# asyncio is built into Python 3.8+
+
+# Optional but recommended for Windows
+colorama==0.4.6  # Colored console output
