@@ -1,4 +1,4 @@
-# app.py - LeadForge Pro v7.0 (Smart Button State Management)
+# app.py - LeadForge Pro v7.0 (Fixed Role & Priority Detection)
 from flask import Flask, request, render_template_string, jsonify, Response
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -65,60 +65,102 @@ init_db()
 # ==================== Lead Classifier ====================
 class LeadClassifier:
     ROLE_PATTERNS = {
-        'executive': ['ceo', 'cfo', 'cto', 'coo', 'president', 'chairman', 'director', 'vp', 'owner', 'founder', 'partner'],
-        'management': ['manager', 'head', 'lead', 'supervisor', 'coordinator'],
-        'sales': ['sales', 'business development', 'bd', 'account executive', 'account manager'],
-        'marketing': ['marketing', 'social media', 'digital', 'content', 'brand', 'pr', 'seo'],
-        'technical': ['engineer', 'developer', 'architect', 'technical', 'devops', 'sysadmin', 'it'],
-        'hr': ['hr', 'human resources', 'recruiting', 'talent'],
-        'finance': ['finance', 'accounting', 'accounts', 'treasury', 'tax'],
-        'support': ['support', 'help', 'service', 'customer'],
-        'admin': ['admin', 'office', 'assistant'],
-        'generic': ['info', 'contact', 'hello', 'team', 'careers']
+        'executive': ['ceo', 'cfo', 'cto', 'coo', 'president', 'chairman', 'director', 'vp', 'vice president', 'owner', 'founder', 'partner', 'executive', 'managing director', 'board'],
+        'management': ['manager', 'head', 'lead', 'supervisor', 'coordinator', 'director of', 'senior manager', 'general manager'],
+        'sales': ['sales', 'business development', 'bd', 'account executive', 'account manager', 'development', 'partnerships', 'sales rep', 'territory', 'channel'],
+        'marketing': ['marketing', 'social media', 'digital', 'content', 'brand', 'pr', 'communications', 'seo', 'sem', 'growth', 'campaign'],
+        'technical': ['engineer', 'developer', 'architect', 'technical', 'devops', 'sysadmin', 'it', 'support', 'helpdesk', 'programmer', 'software', 'qa', 'data'],
+        'hr': ['hr', 'human resources', 'recruiting', 'talent', 'people', 'hiring', 'recruiter', 'personnel'],
+        'finance': ['finance', 'accounting', 'accounts', 'treasury', 'tax', 'audit', 'controller', 'financial', 'budget', 'payroll'],
+        'legal': ['legal', 'counsel', 'attorney', 'lawyer', 'compliance', 'regulatory', 'general counsel'],
+        'support': ['support', 'help', 'service', 'customer', 'client services', 'customer success', 'technical support'],
+        'admin': ['admin', 'office', 'assistant', 'secretary', 'reception', 'front desk', 'clerical', 'coordinator'],
+        'generic': ['info', 'contact', 'hello', 'team', 'careers', 'jobs', 'press', 'media', 'webmaster', 'inquiries', 'mail']
     }
     
-    ROLE_SCORES = {'executive': 100, 'management': 85, 'sales': 80, 'marketing': 75, 'finance': 70, 
-                   'technical': 65, 'hr': 55, 'support': 45, 'admin': 35, 'generic': 25}
+    ROLE_SCORES = {
+        'executive': 100,
+        'management': 85,
+        'sales': 80,
+        'marketing': 75,
+        'finance': 70,
+        'legal': 70,
+        'technical': 65,
+        'hr': 55,
+        'support': 45,
+        'admin': 35,
+        'generic': 25,
+        'personal': 15
+    }
     
     @staticmethod
     def extract_domain(email: str) -> str:
         try:
             if '@' in email:
-                return email.split('@')[1].lower()
+                domain = email.split('@')[1].lower()
+                # Remove common prefixes
+                for prefix in ['www.', 'mail.', 'email.']:
+                    if domain.startswith(prefix):
+                        domain = domain[len(prefix):]
+                return domain
         except:
             pass
         return 'unknown'
     
     @staticmethod
     def detect_role(email: str) -> str:
-        local = email.split('@')[0].lower() if '@' in email else ''
+        """Enhanced role detection from email"""
+        if '@' not in email:
+            return 'generic'
+        
+        local = email.split('@')[0].lower()
+        
+        # Check for role patterns first
         for role, patterns in LeadClassifier.ROLE_PATTERNS.items():
             for pattern in patterns:
                 if pattern in local:
+                    app.logger.info(f"Role detected: {role} from {pattern} in {local}")
                     return role
+        
+        # Check if it's a personal email (name based)
+        parts = re.split(r'[._\-]', local)
+        if len(parts) >= 2:
+            # Check if it looks like firstname.lastname
+            if parts[0].isalpha() and len(parts[0]) >= 2 and parts[1].isalpha() and len(parts[1]) >= 2:
+                return 'personal'
+            # Check for first initial + last name
+            if len(parts[0]) == 1 and parts[0].isalpha() and parts[1].isalpha() and len(parts[1]) >= 2:
+                return 'personal'
+        
         return 'generic'
     
     @staticmethod
     def get_priority(role: str) -> str:
+        """Get priority based on role"""
         if role in ['executive', 'management']:
             return 'high'
-        elif role in ['sales', 'marketing', 'finance']:
+        elif role in ['sales', 'marketing', 'finance', 'legal']:
             return 'medium'
-        return 'low'
+        else:
+            return 'low'
     
     @staticmethod
     def get_score(role: str) -> int:
+        """Get numeric score for role"""
         return LeadClassifier.ROLE_SCORES.get(role, 25)
 
 # ==================== Validator ====================
 class Validator:
     @staticmethod
-    def validate_email(email: str) -> Tuple[bool, Optional[str]]:
+    def validate_email(email: str) -> Tuple[bool, Optional[str], Optional[str]]:
         try:
             validation = validate_email(email, check_deliverability=False)
-            return True, validation.normalized
+            normalized = validation.normalized
+            # Detect role immediately
+            role = LeadClassifier.detect_role(normalized)
+            return True, normalized, role
         except:
-            return False, None
+            return False, None, None
     
     @staticmethod
     def validate_phone(phone: str) -> Tuple[bool, Optional[str]]:
@@ -164,25 +206,45 @@ class LeadProcessor:
             is_phone = re.search(r'\d{3}[-.]?\d{3}[-.]?\d{4}', item) or re.search(r'\+?\d{10,}', item)
             
             if is_email:
-                valid, normalized = Validator.validate_email(item)
+                valid, normalized, role = Validator.validate_email(item)
                 if valid:
                     domain = LeadClassifier.extract_domain(normalized)
-                    role = LeadClassifier.detect_role(normalized)
                     priority = LeadClassifier.get_priority(role)
                     score = LeadClassifier.get_score(role)
-                    results['valid'].append({'value': normalized, 'type': 'email', 'role': role, 'priority': priority})
-                    c.execute('INSERT INTO leads (session_id, type, value, domain, role, priority, confidence_score) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    
+                    results['valid'].append({
+                        'value': normalized, 
+                        'type': 'email', 
+                        'role': role, 
+                        'priority': priority,
+                        'score': score
+                    })
+                    
+                    c.execute('''INSERT INTO leads (session_id, type, value, domain, role, priority, confidence_score) 
+                                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
                              (session_id, 'email', normalized, domain, role, priority, score/100))
+                    
+                    app.logger.info(f"Saved email: {normalized} | Role: {role} | Priority: {priority}")
+                    
             elif is_phone:
                 valid, normalized = Validator.validate_phone(item)
                 if valid:
-                    results['valid'].append({'value': normalized, 'type': 'phone', 'role': 'contact', 'priority': 'medium'})
-                    c.execute('INSERT INTO leads (session_id, type, value, domain, role, priority, confidence_score) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    results['valid'].append({
+                        'value': normalized, 
+                        'type': 'phone', 
+                        'role': 'contact', 
+                        'priority': 'medium',
+                        'score': 50
+                    })
+                    c.execute('''INSERT INTO leads (session_id, type, value, domain, role, priority, confidence_score) 
+                                 VALUES (?, ?, ?, ?, ?, ?, ?)''',
                              (session_id, 'phone', normalized, 'phone', 'contact', 'medium', 0.85))
             else:
                 results['invalid'].append({'value': item, 'reason': 'Invalid email or phone'})
         
         conn.commit()
+        
+        # Update session status
         c.execute('INSERT OR REPLACE INTO sessions (id, status) VALUES (?, ?)', (session_id, 'validated'))
         conn.commit()
         conn.close()
@@ -193,24 +255,41 @@ class LeadProcessor:
 class LeadExtractor:
     @staticmethod
     def extract_and_classify(session_id: str) -> Dict:
+        """Re-classify all leads in a session (ensures roles are set)"""
         conn = sqlite3.connect(Config.DATABASE)
         c = conn.cursor()
-        c.execute('SELECT id, value FROM leads WHERE session_id = ? AND type = "email" AND role IS NULL', (session_id,))
+        
+        # Get all email leads that need classification
+        c.execute('SELECT id, value FROM leads WHERE session_id = ? AND type = "email"', (session_id,))
         leads = c.fetchall()
         
+        extracted_count = 0
         for lead_id, value in leads:
+            # Detect role
             role = LeadClassifier.detect_role(value)
             priority = LeadClassifier.get_priority(role)
             domain = LeadClassifier.extract_domain(value)
             score = LeadClassifier.get_score(role)
-            c.execute('UPDATE leads SET role = ?, priority = ?, domain = ?, confidence_score = ? WHERE id = ?',
+            
+            # Update the lead
+            c.execute('''UPDATE leads 
+                         SET role = ?, priority = ?, domain = ?, confidence_score = ? 
+                         WHERE id = ?''',
                      (role, priority, domain, score/100, lead_id))
+            extracted_count += 1
+            app.logger.info(f"Updated lead {lead_id}: {value} -> Role: {role}, Priority: {priority}")
+        
+        # Also update phone leads with proper priority
+        c.execute('SELECT id FROM leads WHERE session_id = ? AND type = "phone" AND role IS NULL', (session_id,))
+        phone_leads = c.fetchall()
+        for lead_id in phone_leads:
+            c.execute('UPDATE leads SET role = ?, priority = ? WHERE id = ?', ('contact', 'medium', lead_id[0]))
         
         c.execute('UPDATE sessions SET status = ? WHERE id = ?', ('extracted', session_id))
         conn.commit()
         conn.close()
         
-        return {'extracted': len(leads), 'session_id': session_id}
+        return {'extracted': extracted_count, 'session_id': session_id}
 
 # ==================== Lead Sorter ====================
 class LeadSorter:
@@ -228,7 +307,7 @@ class LeadSorter:
         for lead in leads:
             role = lead.get('role', 'generic')
             groups[role].append(lead)
-        order = ['executive', 'management', 'sales', 'marketing', 'finance', 'technical', 'hr', 'support', 'admin', 'contact', 'generic']
+        order = ['executive', 'management', 'sales', 'marketing', 'finance', 'legal', 'technical', 'hr', 'support', 'admin', 'contact', 'personal', 'generic']
         return {role: groups[role] for role in order if role in groups}
     
     @staticmethod
@@ -259,13 +338,29 @@ class ExportManager:
     
     @staticmethod
     def to_excel(leads: List[Dict]) -> bytes:
-        data = [{'Type': l.get('type', ''), 'Value': l.get('value', ''), 'Domain': l.get('domain', ''),
-                 'Role': l.get('role', '').upper(), 'Priority': l.get('priority', '').upper(),
-                 'Score': f"{l.get('confidence_score', 0)*100:.0f}%"} for l in leads]
+        data = []
+        for lead in leads:
+            data.append({
+                'Type': lead.get('type', ''),
+                'Value': lead.get('value', ''),
+                'Domain': lead.get('domain', ''),
+                'Role': lead.get('role', '').upper(),
+                'Priority': lead.get('priority', '').upper(),
+                'Score': f"{lead.get('confidence_score', 0)*100:.0f}%"
+            })
         df = pd.DataFrame(data)
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Leads', index=False)
+            # Color code by priority
+            worksheet = writer.sheets['Leads']
+            for row_idx, lead in enumerate(data, start=2):
+                if lead['Priority'] == 'HIGH':
+                    for col in range(1, 7):
+                        worksheet.cell(row=row_idx, column=col).fill = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+                elif lead['Priority'] == 'MEDIUM':
+                    for col in range(1, 7):
+                        worksheet.cell(row=row_idx, column=col).fill = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
         output.seek(0)
         return output.getvalue()
     
@@ -341,8 +436,16 @@ def sort_leads(session_id):
     if not leads_data:
         return jsonify({'error': 'No leads found'}), 404
     
-    leads = [{'type': l[0], 'value': l[1], 'domain': l[2] or 'unknown', 'role': l[3] or 'generic',
-              'priority': l[4] or 'low', 'confidence_score': l[5]} for l in leads_data]
+    leads = []
+    for l in leads_data:
+        leads.append({
+            'type': l[0], 
+            'value': l[1], 
+            'domain': l[2] or 'unknown', 
+            'role': l[3] or 'generic', 
+            'priority': l[4] or 'low', 
+            'confidence_score': l[5] or 0.5
+        })
     
     if sort_type == 'domain':
         sorted_data = LeadSorter.sort_by_domain(leads)
@@ -369,8 +472,16 @@ def export_leads(session_id):
     if not leads_data:
         return jsonify({'error': 'No leads found'}), 404
     
-    leads = [{'type': l[0], 'value': l[1], 'domain': l[2] or 'unknown', 'role': l[3] or 'generic',
-              'priority': l[4] or 'low', 'confidence_score': l[5]} for l in leads_data]
+    leads = []
+    for l in leads_data:
+        leads.append({
+            'type': l[0], 
+            'value': l[1], 
+            'domain': l[2] or 'unknown', 
+            'role': l[3] or 'generic', 
+            'priority': l[4] or 'low', 
+            'confidence_score': l[5] or 0.5
+        })
     
     # Apply sorting
     if sort_by == 'domain':
@@ -405,10 +516,7 @@ def session_status(session_id):
     conn.close()
     
     status = result[0] if result else 'none'
-    c.execute('SELECT COUNT(*) FROM leads WHERE session_id = ?', (session_id,))
-    lead_count = c.fetchone()[0] if result else 0
-    
-    return jsonify({'session_id': session_id, 'status': status, 'lead_count': lead_count})
+    return jsonify({'session_id': session_id, 'status': status})
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -422,7 +530,7 @@ def get_stats():
     unique_emails = c.fetchone()[0] or 0
     c.execute('SELECT COUNT(DISTINCT value) FROM leads WHERE type = "phone"')
     unique_phones = c.fetchone()[0] or 0
-    c.execute('SELECT COUNT(DISTINCT domain) FROM leads WHERE domain != "unknown"')
+    c.execute('SELECT COUNT(DISTINCT domain) FROM leads WHERE domain != "unknown" AND domain != "phone"')
     unique_domains = c.fetchone()[0] or 0
     conn.close()
     return jsonify({'total_sessions': total_sessions, 'total_leads': total_leads,
@@ -452,7 +560,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LeadForge Pro - Smart Lead Processor</title>
+    <title>LeadForge Pro - Lead Extractor & Sorter</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
@@ -461,9 +569,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .btn { transition: all 0.2s ease; cursor: pointer; }
         .btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .btn-active { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 2px 10px rgba(102,126,234,0.4); }
-        .btn-inactive { background: #9ca3af; color: white; }
-        .btn-success { background: #10b981; color: white; }
+        .btn-active { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
         .priority-high { background: #fee2e2; border-left: 4px solid #dc2626; }
         .priority-medium { background: #fef3c7; border-left: 4px solid #f59e0b; }
         .priority-low { background: #e0e7ff; border-left: 4px solid #6366f1; }
@@ -472,15 +578,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .role-management { background: #f59e0b; color: white; }
         .role-sales { background: #10b981; color: white; }
         .role-marketing { background: #3b82f6; color: white; }
+        .role-finance { background: #8b5cf6; color: white; }
+        .role-technical { background: #06b6d4; color: white; }
+        .role-contact { background: #6b7280; color: white; }
         .fade-in { animation: fadeIn 0.3s ease-in; }
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        .step-indicator { display: flex; align-items: center; justify-content: center; margin-bottom: 30px; }
-        .step { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; margin: 0 10px; }
-        .step-active { background: #667eea; color: white; }
-        .step-completed { background: #10b981; color: white; }
-        .step-pending { background: #e5e7eb; color: #6b7280; }
-        .step-line { width: 80px; height: 2px; background: #e5e7eb; }
-        .step-line-active { background: #667eea; }
     </style>
 </head>
 <body class="bg-gray-50">
@@ -492,7 +594,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <span class="text-2xl font-bold">LeadForge Pro</span>
                 </div>
                 <div class="text-sm">
-                    <i class="fas fa-check-circle mr-1"></i> Smart Button States
+                    <i class="fas fa-check-circle mr-1"></i> Role & Priority Detection Active
                 </div>
             </div>
         </div>
@@ -501,25 +603,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="gradient-bg text-white py-8">
         <div class="container mx-auto px-6 text-center">
             <h1 class="text-3xl font-bold mb-2">Lead Extractor & Domain Sorter</h1>
-            <p class="text-lg opacity-90">Follow the workflow - buttons activate as you progress</p>
+            <p class="text-lg opacity-90">Automatic role detection (CEO, Manager, Sales, etc.) and priority scoring</p>
         </div>
     </div>
 
     <div class="container mx-auto px-6 py-8">
-        <!-- Step Indicator -->
-        <div class="step-indicator">
-            <div id="step1Indicator" class="step step-active">1</div>
-            <div id="step1Line" class="step-line"></div>
-            <div id="step2Indicator" class="step step-pending">2</div>
-            <div id="step2Line" class="step-line"></div>
-            <div id="step3Indicator" class="step step-pending">3</div>
-            <div id="step3Line" class="step-line"></div>
-            <div id="step4Indicator" class="step step-pending">4</div>
-        </div>
-        <div class="text-center text-sm text-gray-600 mb-8">
-            <span id="stepLabel">Step 1: Upload Data</span>
-        </div>
-
         <!-- Step 1: Upload Card -->
         <div id="step1Card" class="bg-white rounded-2xl shadow-xl p-8 mb-8 fade-in">
             <h2 class="text-2xl font-bold mb-4"><i class="fas fa-cloud-upload-alt text-purple-600 mr-2"></i>Step 1: Upload Data</h2>
@@ -541,10 +629,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="border-2 border-gray-300 rounded-lg p-6 hover:border-purple-500 transition">
                     <i class="fas fa-file-alt text-4xl text-gray-400 mb-3"></i>
                     <h3 class="font-bold mb-2">Paste Text</h3>
-                    <textarea id="textInput" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500" placeholder="ceo@company.com, sales@domain.com, +1234567890"></textarea>
+                    <textarea id="textInput" rows="3" class="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:border-purple-500" 
+                        placeholder="ceo@company.com, sales@domain.com, +1234567890&#10;john.doe@gmail.com, manager@business.com, 555-123-4567"></textarea>
                     <button id="validateTextBtn" class="mt-3 bg-green-600 text-white px-6 py-2 rounded-lg btn w-full">
                         <i class="fas fa-check-circle mr-2"></i>Validate & Extract
                     </button>
+                </div>
+            </div>
+            
+            <div class="mt-6 p-4 bg-blue-50 rounded-lg">
+                <h4 class="font-bold text-blue-800 mb-2"><i class="fas fa-info-circle mr-1"></i>Role Detection Examples:</h4>
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+                    <div><span class="role-badge role-executive">CEO</span> ceo@company.com</div>
+                    <div><span class="role-badge role-executive">CFO</span> cfo@company.com</div>
+                    <div><span class="role-badge role-management">Manager</span> manager@company.com</div>
+                    <div><span class="role-badge role-sales">Sales</span> sales@company.com</div>
+                    <div><span class="role-badge role-marketing">Marketing</span> marketing@company.com</div>
+                    <div><span class="role-badge role-technical">Engineer</span> engineer@company.com</div>
+                    <div><span class="role-badge role-finance">Finance</span> finance@company.com</div>
+                    <div><span class="role-badge role-contact">Personal</span> john.doe@gmail.com</div>
                 </div>
             </div>
         </div>
@@ -555,7 +658,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div id="validationResults" class="mb-4"></div>
             <div class="flex gap-3">
                 <button id="extractBtn" disabled class="bg-gray-400 text-white px-6 py-3 rounded-lg btn">
-                    <i class="fas fa-magic mr-2"></i>Extract & Classify
+                    <i class="fas fa-magic mr-2"></i>Extract & Classify Roles
                 </button>
                 <button id="clearResultsBtn" class="bg-gray-600 text-white px-6 py-3 rounded-lg btn">
                     <i class="fas fa-eraser mr-2"></i>Clear Results
@@ -610,7 +713,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <script>
         let currentSessionId = null;
         let currentSortType = 'domain';
-        let currentStep = 1;
         
         // Button elements
         const uploadBtn = document.getElementById('uploadBtn');
@@ -641,7 +743,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             } catch(e) { console.error(e); }
         }
         
-        // File upload handling
         function updateFileName(input) {
             const fileName = input.files[0]?.name || '';
             document.getElementById('fileName').innerHTML = `<i class="fas fa-check-circle text-green-600"></i> ${fileName}`;
@@ -677,15 +778,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 if (data.success) {
                     currentSessionId = data.session_id;
                     displayValidationResults(data);
-                    goToStep(2);
                     showNotification(`✅ Valid: ${data.valid_count} | ❌ Invalid: ${data.invalid_count}`, 'success');
                 } else {
                     showNotification('Error: ' + data.error, 'error');
-                    uploadBtn.disabled = false;
-                    uploadBtn.innerHTML = '<i class="fas fa-upload mr-2"></i>Upload & Validate';
                 }
             } catch(e) {
                 showNotification('Error: ' + e.message, 'error');
+            } finally {
                 uploadBtn.disabled = false;
                 uploadBtn.innerHTML = '<i class="fas fa-upload mr-2"></i>Upload & Validate';
             }
@@ -713,7 +812,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 if (data.success) {
                     currentSessionId = data.session_id;
                     displayValidationResults(data);
-                    goToStep(2);
                     showNotification(`✅ Valid: ${data.valid_count} | ❌ Invalid: ${data.invalid_count}`, 'success');
                 } else {
                     showNotification('Error: ' + data.error, 'error');
@@ -739,11 +837,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>`;
             
             if (data.valid_items && data.valid_items.length > 0) {
-                html += `<div class="mb-4"><h3 class="font-bold mb-2">✅ Valid Items:</h3><div class="space-y-1 max-h-48 overflow-y-auto">`;
+                html += `<div class="mb-4"><h3 class="font-bold mb-2">✅ Valid Items (with detected roles):</h3><div class="space-y-1 max-h-48 overflow-y-auto">`;
                 data.valid_items.forEach(item => {
                     const icon = item.type === 'email' ? '<i class="fas fa-envelope text-blue-600"></i>' : '<i class="fas fa-phone text-green-600"></i>';
+                    const roleBadge = item.role ? `<span class="role-badge role-${item.role} ml-2">${item.role.toUpperCase()}</span>` : '';
+                    const priorityBadge = item.priority ? `<span class="text-xs ml-2 ${item.priority === 'high' ? 'text-red-600' : item.priority === 'medium' ? 'text-yellow-600' : 'text-blue-600'}">${item.priority}</span>` : '';
+                    
                     html += `<div class="flex justify-between items-center p-2 bg-gray-50 rounded">
-                                <div>${icon} <span class="font-mono">${escapeHtml(item.value)}</span> <span class="text-xs text-gray-500">${item.type}</span></div>
+                                <div>${icon} <span class="font-mono">${escapeHtml(item.value)}</span> ${roleBadge} ${priorityBadge}</div>
                                 <button onclick="copyToClipboard('${escapeHtml(item.value)}')" class="text-purple-600 hover:text-purple-800"><i class="fas fa-copy"></i></button>
                             </div>`;
                 });
@@ -762,6 +863,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
             
             document.getElementById('validationResults').innerHTML = html;
+            document.getElementById('step2Card').style.display = 'block';
+            document.getElementById('step1Card').style.display = 'none';
             
             // Enable extract button
             extractBtn.disabled = false;
@@ -772,18 +875,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         async function extractLeads() {
             if (!currentSessionId) return;
             
-            showNotification('Extracting and classifying leads...', 'info');
+            showNotification('Extracting and classifying leads by role...', 'info');
             extractBtn.disabled = true;
-            extractBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Extracting...';
+            extractBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>Classifying...';
             
             try {
                 const response = await fetch(`/api/extract/${currentSessionId}`, { method: 'POST' });
                 const data = await response.json();
                 
                 if (data.success) {
-                    showNotification('Extraction completed!', 'success');
-                    goToStep(3);
+                    showNotification(`✅ Classified ${data.extracted} leads with roles and priorities!`, 'success');
+                    // Load sorted results
                     await sortBy('domain');
+                    document.getElementById('step3Card').style.display = 'block';
                 } else {
                     showNotification('Error: ' + data.error, 'error');
                 }
@@ -791,7 +895,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 showNotification('Error: ' + e.message, 'error');
             } finally {
                 extractBtn.disabled = false;
-                extractBtn.innerHTML = '<i class="fas fa-magic mr-2"></i>Extract & Classify';
+                extractBtn.innerHTML = '<i class="fas fa-magic mr-2"></i>Extract & Classify Roles';
             }
         }
         
@@ -840,8 +944,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         
         function getRoleBadge(role) {
             const classes = {
-                'executive': 'role-executive', 'management': 'role-management',
-                'sales': 'role-sales', 'marketing': 'role-marketing'
+                'executive': 'role-executive',
+                'management': 'role-management',
+                'sales': 'role-sales',
+                'marketing': 'role-marketing',
+                'finance': 'role-finance',
+                'technical': 'role-technical',
+                'contact': 'role-contact'
             };
             return `<span class="role-badge ${classes[role] || 'bg-gray-500'}">${role.toUpperCase()}</span>`;
         }
@@ -875,10 +984,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     const icon = lead.type === 'email' ? '<i class="fas fa-envelope text-blue-600"></i>' : '<i class="fas fa-phone text-green-600"></i>';
                     const roleBadge = lead.role ? getRoleBadge(lead.role) : '';
                     const priorityClass = getPriorityClass(lead.priority);
+                    const score = lead.confidence_score ? Math.round(lead.confidence_score * 100) : 0;
                     
                     html += `<div class="${priorityClass} flex justify-between items-center p-2 bg-white rounded shadow-sm">
-                                <div>${icon} <span class="font-mono text-sm">${escapeHtml(lead.value)}</span> ${roleBadge}</div>
-                                <button onclick="copyToClipboard('${escapeHtml(lead.value)}')" class="text-purple-600 hover:text-purple-800"><i class="fas fa-copy"></i></button>
+                                <div>
+                                    ${icon} <span class="font-mono text-sm">${escapeHtml(lead.value)}</span>
+                                    ${roleBadge}
+                                    <span class="text-xs ml-1 ${lead.priority === 'high' ? 'text-red-600' : lead.priority === 'medium' ? 'text-yellow-600' : 'text-blue-600'}">
+                                        (${score}%)
+                                    </span>
+                                </div>
+                                <button onclick="copyToClipboard('${escapeHtml(lead.value)}')" class="text-purple-600 hover:text-purple-800">
+                                    <i class="fas fa-copy"></i>
+                                </button>
                             </div>`;
                 });
                 
@@ -914,42 +1032,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
             document.getElementById('step2Card').style.display = 'none';
             document.getElementById('step3Card').style.display = 'none';
+            document.getElementById('step1Card').style.display = 'block';
             document.getElementById('validationResults').innerHTML = '';
             document.getElementById('textInput').value = '';
             document.getElementById('csvFile').value = '';
             document.getElementById('fileName').innerHTML = '';
             document.getElementById('sortedResults').innerHTML = '';
             currentSessionId = null;
-            goToStep(1);
+            
+            // Reset buttons
+            extractBtn.disabled = true;
+            extractBtn.classList.add('bg-gray-400');
+            extractBtn.classList.remove('bg-purple-600', 'btn-active');
+            
+            [sortDomainBtn, sortRoleBtn, sortPriorityBtn].forEach(btn => {
+                btn.disabled = true;
+                btn.classList.add('bg-gray-400');
+                btn.classList.remove('btn-active', 'bg-gray-600');
+            });
+            
+            [exportCsvBtn, exportExcelBtn, exportJsonBtn].forEach(btn => {
+                btn.disabled = true;
+                btn.classList.add('bg-gray-400');
+                btn.classList.remove('bg-green-600', 'btn-active');
+            });
+            
             showNotification('Results cleared', 'success');
-        }
-        
-        function goToStep(step) {
-            currentStep = step;
-            
-            // Update step indicators
-            for (let i = 1; i <= 4; i++) {
-                const indicator = document.getElementById(`step${i}Indicator`);
-                const line = document.getElementById(`step${i}Line`);
-                if (i < step) {
-                    indicator.className = 'step step-completed';
-                    if (line) line.className = 'step-line step-line-active';
-                } else if (i === step) {
-                    indicator.className = 'step step-active';
-                    if (line) line.className = 'step-line';
-                } else {
-                    indicator.className = 'step step-pending';
-                    if (line) line.className = 'step-line';
-                }
-            }
-            
-            const stepLabels = ['', 'Upload Data', 'Validation Results', 'Sort & Export', 'Complete'];
-            document.getElementById('stepLabel').textContent = `Step ${step}: ${stepLabels[step]}`;
-            
-            // Show/hide cards
-            document.getElementById('step1Card').style.display = step === 1 ? 'block' : 'none';
-            document.getElementById('step2Card').style.display = step === 2 ? 'block' : 'none';
-            document.getElementById('step3Card').style.display = step === 3 ? 'block' : 'none';
         }
         
         function copyToClipboard(text) {
@@ -995,22 +1103,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("🔥 LeadForge Pro - Smart Button State Management")
+    print("🔥 LeadForge Pro - Role & Priority Detection Fixed")
     print("=" * 60)
     print(f"📍 Server: http://127.0.0.1:5000")
-    print(f"💻 OS: {platform.system()}")
     print("=" * 60)
-    print("🎯 BUTTON STATES:")
-    print("   • Buttons are INACTIVE (gray) until prerequisites are met")
-    print("   • Buttons become ACTIVE (colored) when ready to use")
-    print("   • Active buttons have gradient/hover effects")
-    print("   • Step indicator shows current workflow position")
-    print("=" * 60)
-    print("📋 WORKFLOW:")
-    print("   1. Upload CSV OR Paste Text → 'Upload & Validate' or 'Validate & Extract'")
-    print("   2. After validation → 'Extract & Classify' becomes active")
-    print("   3. After extraction → Sort buttons become active")
-    print("   4. After sorting → Export buttons become active")
+    print("🎯 ROLE DETECTION EXAMPLES:")
+    print("   ceo@company.com     → Executive (High Priority)")
+    print("   manager@company.com → Management (High Priority)")
+    print("   sales@company.com   → Sales (Medium Priority)")
+    print("   engineer@company.com → Technical (Low Priority)")
+    print("   john@gmail.com      → Personal (Low Priority)")
     print("=" * 60)
     
     app.run(debug=False, host='127.0.0.1', port=5000, threaded=True)
